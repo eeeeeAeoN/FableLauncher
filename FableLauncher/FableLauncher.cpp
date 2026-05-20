@@ -134,46 +134,81 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBoxA(NULL, err.c_str(), "Launcher Error", MB_ICONERROR);
         return 1;
     }
+    bool earlyInjectOk = true;
+    std::string earlyInjectError;
 
-    bool allInjectionsSucceeded = true;
-    std::string firstErrorMsg = "";
-
-    if (!modsToInject.empty())
+    for (const auto& modName : modsToInject)
     {
-        for (const auto& modName : modsToInject)
+        if (modName != g_scriptExtenderName) continue;
+
+        std::string fullDllPath = currentDir + "\\" + modName;
+        if (!std::filesystem::exists(fullDllPath))
         {
-            std::string fullDllPath;
-            std::string errorDetails;
-
-            if (modName == g_scriptExtenderName)
-                fullDllPath = currentDir + "\\" + modName;
-            else
-                fullDllPath = modsPath + "\\" + modName;
-
-            if (!std::filesystem::exists(fullDllPath))
-            {
-                allInjectionsSucceeded = false;
-                firstErrorMsg = "Mod file not found:\n" + fullDllPath;
-                break;
-            }
-
-            if (!InjectDLL(pi.hProcess, fullDllPath, errorDetails))
-            {
-                allInjectionsSucceeded = false;
-                firstErrorMsg = "Failed to inject " + modName + ":\n" + errorDetails;
-                break;
-            }
+            earlyInjectOk = false;
+            earlyInjectError = "Script extender not found:\n" + fullDllPath;
+            break;
         }
+        std::string errorDetails;
+        if (!InjectDLL(pi.hProcess, fullDllPath, errorDetails))
+        {
+            earlyInjectOk = false;
+            earlyInjectError = "Failed to inject " + modName + ":\n" + errorDetails;
+            break;
+        }
+        break;
     }
 
-    if (allInjectionsSucceeded)
-    {
-        ResumeThread(pi.hThread);
-    }
-    else
+    if (!earlyInjectOk)
     {
         TerminateProcess(pi.hProcess, 1);
-        MessageBoxA(NULL, firstErrorMsg.c_str(), "Injection Failed", MB_ICONERROR);
+        MessageBoxA(NULL, earlyInjectError.c_str(), "Injection Failed", MB_ICONERROR);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return 1;
+    }
+    ResumeThread(pi.hThread);
+
+    const DWORD INIT_TIMEOUT_MS = 30000;
+    DWORD waitResult = WaitForInputIdle(pi.hProcess, INIT_TIMEOUT_MS);
+
+    if (waitResult == WAIT_FAILED)
+    {
+        MessageBoxA(NULL,
+            "The game process exited or became unresponsive before mods could be injected.\n\nTry launching without mods to check if the base game works.",
+            "Launch Failed", MB_ICONERROR);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return 1;
+    }
+
+    bool lateInjectOk = true;
+    std::string lateInjectError;
+
+    for (const auto& modName : modsToInject)
+    {
+        if (modName == g_scriptExtenderName) continue;
+
+        std::string fullDllPath = modsPath + "\\" + modName;
+        if (!std::filesystem::exists(fullDllPath))
+        {
+            lateInjectOk = false;
+            lateInjectError = "Mod file not found:\n" + fullDllPath;
+            break;
+        }
+
+        std::string errorDetails;
+        if (!InjectDLL(pi.hProcess, fullDllPath, errorDetails))
+        {
+            lateInjectOk = false;
+            lateInjectError = "Failed to inject " + modName + ":\n" + errorDetails;
+            break;
+        }
+
+        Sleep(150);
+
+    if (!lateInjectOk)
+    {
+        MessageBoxA(NULL, lateInjectError.c_str(), "Mod Injection Warning", MB_ICONWARNING);
     }
 
     CloseHandle(pi.hProcess);
