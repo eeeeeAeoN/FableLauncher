@@ -1,218 +1,191 @@
 #include <windows.h>
-#include <tlhelp32.h> 
-#include <string>
+
 #include <filesystem>
+#include <string>
 #include <vector>
-#include <sstream>
+#include <algorithm>
 
-std::string GetLastErrorAsString()
+namespace fs = std::filesystem;
+
+constexpr DWORD DEFAULT_INIT_DELAY = 3000;
+constexpr DWORD DEFAULT_PER_MOD_DELAY = 150;
+
+const std::string SCRIPT_EXTENDER = "FableScriptExtender.dll";
+
+fs::path GetModuleDirectory()
 {
-    DWORD errorMessageID = ::GetLastError();
-    if (errorMessageID == 0) return "No error message has been recorded";
+    char buffer[MAX_PATH];
+    GetModuleFileNameA(nullptr, buffer, MAX_PATH);
 
-    LPSTR messageBuffer = nullptr;
-    size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
-
-    std::string message(messageBuffer, size);
-    LocalFree(messageBuffer);
-    return message;
+    return fs::path(buffer).parent_path();
 }
 
-std::string GetCurrentDirectoryPath()
+bool IsSupportedExecutable()
 {
-    char launcherPath[MAX_PATH];
-    GetModuleFileNameA(NULL, launcherPath, MAX_PATH);
-    return std::filesystem::path(launcherPath).parent_path().string();
+    char path[MAX_PATH]{};
+
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+
+    return _stricmp(
+        std::filesystem::path(path).filename().string().c_str(),
+        "Fable.exe") == 0;
 }
 
-bool InjectDLL(HANDLE hProcess, const std::string& dllPath, std::string& outError)
-{
-    if (dllPath.empty())
-    {
-        outError = "InjectDLL called with an empty path.";
-        return false;
-    }
-
-    void* pRemotePath = VirtualAllocEx(hProcess, NULL, dllPath.length() + 1, MEM_COMMIT, PAGE_READWRITE);
-    if (!pRemotePath)
-    {
-        outError = "VirtualAllocEx failed for " + dllPath + "\n" + GetLastErrorAsString();
-        return false;
-    }
-
-    if (!WriteProcessMemory(hProcess, pRemotePath, dllPath.c_str(), dllPath.length() + 1, NULL))
-    {
-        outError = "WriteProcessMemory failed for " + dllPath + "\n" + GetLastErrorAsString();
-        VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
-        return false;
-    }
-
-    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    FARPROC pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
-    if (!pLoadLibraryA)
-    {
-        outError = "GetProcAddress for LoadLibraryA failed.\n" + GetLastErrorAsString();
-        VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
-        return false;
-    }
-
-    HANDLE hRemoteThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibraryA, pRemotePath, 0, NULL);
-    if (!hRemoteThread)
-    {
-        outError = "CreateRemoteThread failed for " + dllPath + "\n" + GetLastErrorAsString();
-        VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
-        return false;
-    }
-
-    WaitForSingleObject(hRemoteThread, INFINITE);
-
-    DWORD exitCode = 0;
-    GetExitCodeThread(hRemoteThread, &exitCode);
-
-    CloseHandle(hRemoteThread);
-    VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
-
-    if (exitCode == 0)
-    {
-        outError = "LoadLibraryA failed inside the game process for: " + dllPath +
-            "\nThis implies missing dependencies (like VC++ Redists) or a corrupt DLL.";
-        return false;
-    }
-
-    return true;
-}
-
-std::vector<std::string> GetEnabledMods(const std::string& iniPath)
+std::vector<std::string> GetEnabledMods(const fs::path& iniPath)
 {
     std::vector<std::string> enabledMods;
-    char sectionBuffer[8192];
 
-    DWORD bytesRead = GetPrivateProfileSectionA("Mods", sectionBuffer, 8192, iniPath.c_str());
+    char section[8192]{};
 
-    if (bytesRead == 0) return enabledMods;
+    DWORD bytesRead = GetPrivateProfileSectionA(
+        "Mods",
+        section,
+        sizeof(section),
+        iniPath.string().c_str());
 
-    for (const char* p = sectionBuffer; *p;)
+    if (bytesRead == 0)
+        return enabledMods;
+
+    for (const char* p = section; *p;)
     {
-        std::string entry(p);
-        size_t equalsPos = entry.find('=');
-        if (equalsPos != std::string::npos)
+        std::string entry = p;
+
+        auto equals = entry.find('=');
+
+        if (equals != std::string::npos)
         {
-            std::string modName = entry.substr(0, equalsPos);
-            std::string isEnabled = entry.substr(equalsPos + 1);
-            if (isEnabled == "1") enabledMods.push_back(modName);
+            std::string dll = entry.substr(0, equals);
+            std::string enabled = entry.substr(equals + 1);
+
+            if (enabled == "1")
+                enabledMods.push_back(dll);
         }
+
         p += entry.length() + 1;
     }
+
     return enabledMods;
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
+fs::path GetModsDirectory(const fs::path& iniPath, const fs::path& gameDir)
 {
-    const char* g_gameExeName = "Fable.exe";
-    const std::string g_scriptExtenderName = "FableScriptExtender.dll";
+    char modsDir[MAX_PATH]{};
 
-    std::string currentDir = GetCurrentDirectoryPath();
-    std::string gamePath = currentDir + "\\" + g_gameExeName;
-    std::string iniPath = currentDir + "\\Mods.ini";
+    GetPrivateProfileStringA(
+        "Settings",
+        "ModsDirectory",
+        ".\\Mods",
+        modsDir,
+        MAX_PATH,
+        iniPath.string().c_str());
 
-    char modsDir[MAX_PATH];
-    GetPrivateProfileStringA("Settings", "ModsDirectory", ".\\Mods", modsDir, MAX_PATH, iniPath.c_str());
-    std::string modsPath = currentDir + "\\" + modsDir;
+    fs::path path(modsDir);
 
-    std::vector<std::string> modsToInject = GetEnabledMods(iniPath);
+    if (path.is_relative())
+        path = gameDir / path;
 
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
+    return path.lexically_normal();
+}
 
-    if (!CreateProcessA(gamePath.c_str(), NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, currentDir.c_str(), &si, &pi))
+DWORD GetInitializationDelay(const fs::path& iniPath)
+{
+    return GetPrivateProfileIntA(
+        "Settings",
+        "InitializationDelay",
+        DEFAULT_INIT_DELAY,
+        iniPath.string().c_str());
+}
+
+DWORD GetPerModDelay(const fs::path& iniPath)
+{
+    return GetPrivateProfileIntA(
+        "Settings",
+        "PerModDelay",
+        DEFAULT_PER_MOD_DELAY,
+        iniPath.string().c_str());
+}
+
+bool LoadDll(const fs::path& dllPath)
+{
+    if (!fs::exists(dllPath))
+        return false;
+
+    HMODULE module = LoadLibraryA(dllPath.string().c_str());
+
+    return module != nullptr;
+}
+
+DWORD WINAPI LoaderThread(LPVOID)
+{
+    fs::path gameDir = GetModuleDirectory();
+    fs::path iniPath = gameDir / "Mods.ini";
+
+    std::vector<std::string> enabledMods = GetEnabledMods(iniPath);
+
+    if (enabledMods.empty())
+        return 0;
+
+    fs::path modsDirectory = GetModsDirectory(iniPath, gameDir);
+
+    DWORD initializationDelay = GetInitializationDelay(iniPath);
+    DWORD perModDelay = GetPerModDelay(iniPath);
+
+    auto scriptExtender = std::find(
+        enabledMods.begin(),
+        enabledMods.end(),
+        SCRIPT_EXTENDER);
+
+    if (scriptExtender != enabledMods.end())
     {
-        std::string err = "Could not launch " + std::string(g_gameExeName) + "!\n\nCheck that the launcher is in the same folder as the game.\n\n" + GetLastErrorAsString();
-        MessageBoxA(NULL, err.c_str(), "Launcher Error", MB_ICONERROR);
-        return 1;
+        LoadDll(gameDir / SCRIPT_EXTENDER);
+
+        enabledMods.erase(scriptExtender);
+
+        if (initializationDelay > 0)
+            Sleep(initializationDelay);
     }
-    bool earlyInjectOk = true;
-    std::string earlyInjectError;
 
-    for (const auto& modName : modsToInject)
+    for (const auto& mod : enabledMods)
     {
-        if (modName != g_scriptExtenderName) continue;
+        LoadDll(modsDirectory / mod);
 
-        std::string fullDllPath = currentDir + "\\" + modName;
-        if (!std::filesystem::exists(fullDllPath))
-        {
-            earlyInjectOk = false;
-            earlyInjectError = "Script extender not found:\n" + fullDllPath;
+        if (perModDelay > 0)
+            Sleep(perModDelay);
+    }
+
+    return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule,
+    DWORD ul_reason_for_call,
+    LPVOID)
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+    {
+        DisableThreadLibraryCalls(hModule);
+
+        if (!IsSupportedExecutable())
             break;
-        }
-        std::string errorDetails;
-        if (!InjectDLL(pi.hProcess, fullDllPath, errorDetails))
-        {
-            earlyInjectOk = false;
-            earlyInjectError = "Failed to inject " + modName + ":\n" + errorDetails;
-            break;
-        }
+
+        HANDLE hThread = CreateThread(
+            nullptr,
+            0,
+            LoaderThread,
+            nullptr,
+            0,
+            nullptr);
+
+        if (hThread)
+            CloseHandle(hThread);
+
         break;
     }
 
-    if (!earlyInjectOk)
-    {
-        TerminateProcess(pi.hProcess, 1);
-        MessageBoxA(NULL, earlyInjectError.c_str(), "Injection Failed", MB_ICONERROR);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return 1;
-    }
-    ResumeThread(pi.hThread);
-
-    const DWORD INIT_TIMEOUT_MS = 30000;
-    DWORD waitResult = WaitForInputIdle(pi.hProcess, INIT_TIMEOUT_MS);
-
-    if (waitResult == WAIT_FAILED)
-    {
-        MessageBoxA(NULL,
-            "The game process exited or became unresponsive before mods could be injected.\n\nTry launching without mods to check if the base game works.",
-            "Launch Failed", MB_ICONERROR);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return 1;
+    default:
+        break;
     }
 
-    bool lateInjectOk = true;
-    std::string lateInjectError;
-
-    for (const auto& modName : modsToInject)
-    {
-        if (modName == g_scriptExtenderName) continue;
-
-        std::string fullDllPath = modsPath + "\\" + modName;
-        if (!std::filesystem::exists(fullDllPath))
-        {
-            lateInjectOk = false;
-            lateInjectError = "Mod file not found:\n" + fullDllPath;
-            break;
-        }
-
-        std::string errorDetails;
-        if (!InjectDLL(pi.hProcess, fullDllPath, errorDetails))
-        {
-            lateInjectOk = false;
-            lateInjectError = "Failed to inject " + modName + ":\n" + errorDetails;
-            break;
-        }
-
-        Sleep(150);
-
-    if (!lateInjectOk)
-    {
-        MessageBoxA(NULL, lateInjectError.c_str(), "Mod Injection Warning", MB_ICONWARNING);
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return 0;
+    return TRUE;
 }
